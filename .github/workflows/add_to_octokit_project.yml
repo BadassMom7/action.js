@@ -1,4 +1,4 @@
-name: Add PRs and issues to Octokit org project
+3name: Add PRs and issues to Octokit org project
 
 on:
   issues:
