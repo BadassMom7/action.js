@@ -1,25 +1,31 @@
 import fetchMock from "fetch-mock";
 import { createServer, type Server } from "node:https";
-import { Octokit, getProxyAgent, customFetch } from "../src/index.ts";
-import { ProxyAgent } from "undici";
+import { Octokit, getProxyAgent } from "../src/index.ts";
+import {
+  type Dispatcher,
+  type RequestInfo,
+  type RequestInit,
+  Response,
+  ProxyAgent,
+  default as undici,
+} from "undici";
+import {
+  vi,
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+} from "vitest";
 
-// mock undici such that we can substitute our own fetch implementation
-// but use the actual ProxyAgent implementation for most tests. the
-// exception is "should call undiciFetch with the correct dispatcher"
-// where we want to validate that a mocked ProxyAgent is passed through
-// to undici.fetch.
-jest.mock("undici", () => {
-  return {
-    fetch: jest.fn(),
-    ProxyAgent: jest.requireActual("undici").ProxyAgent,
-  };
-});
-const undici = jest.requireMock("undici");
+let expectedAgent: ProxyAgent;
 
 describe("Smoke test", () => {
   let server: Server;
 
-  beforeAll((done) => {
+  beforeAll(() => {
     server = createServer(
       {
         requestCert: false,
@@ -35,7 +41,7 @@ describe("Smoke test", () => {
       },
     );
 
-    server.listen(0, done);
+    server.listen(0);
   });
 
   beforeEach(() => {
@@ -49,9 +55,9 @@ describe("Smoke test", () => {
     delete process.env.http_proxy;
   });
 
-  afterAll((done) => {
-    server.close(done);
-    jest.unmock("undici");
+  afterAll(() => {
+    server.close();
+    vi.unmock("undici");
   });
 
   it("should return a ProxyAgent for the httpProxy environment variable", () => {
@@ -130,7 +136,7 @@ describe("Smoke test", () => {
     process.env.GITHUB_TOKEN = "secret123";
     process.env.GITHUB_ACTION = "test";
 
-    const mock = fetchMock.sandbox().post(
+    const mock = fetchMock.createInstance().post(
       "path:/repos/octocat/hello-world/issues",
       { id: 1 },
       {
@@ -143,7 +149,7 @@ describe("Smoke test", () => {
     const octokit = new Octokit({
       auth: "secret123",
       request: {
-        fetch: mock,
+        fetch: mock.fetchHandler,
       },
     });
 
@@ -164,7 +170,7 @@ describe("Smoke test", () => {
     process.env.GITHUB_TOKEN = "secret123";
     process.env.GITHUB_ACTION = "test";
 
-    const mock = fetchMock.sandbox().post(
+    const mock = fetchMock.createInstance().post(
       "path:/repos/octocat/hello-world/issues",
       { id: 1 },
       {
@@ -177,7 +183,7 @@ describe("Smoke test", () => {
     const octokit = new Octokit({
       auth: "secret123",
       request: {
-        fetch: mock,
+        fetch: mock.fetchHandler,
       },
     });
 
@@ -203,7 +209,7 @@ describe("Smoke test", () => {
       }
     }`;
 
-    const mock = fetchMock.sandbox().post(
+    const mock = fetchMock.createInstance().post(
       "path:/graphql",
       { data: { ok: true } },
       {
@@ -220,7 +226,7 @@ describe("Smoke test", () => {
     const octokit = new Octokit({
       auth: "secret123",
       request: {
-        fetch: mock,
+        fetch: mock.fetchHandler,
       },
     });
 
@@ -240,8 +246,8 @@ describe("Smoke test", () => {
       process.env.GITHUB_ACTION = "test";
       process.env[https_proxy_env] = "https://127.0.0.1";
 
-      const fetchSandbox = fetchMock.sandbox();
-      const mock = fetchSandbox.post(
+      const fetchcreateInstance = fetchMock.createInstance();
+      const mock = fetchcreateInstance.post(
         "path:/repos/octocat/hello-world/issues",
         { id: 1 },
         {
@@ -255,7 +261,7 @@ describe("Smoke test", () => {
       const octokit = new Octokit({
         auth: "secret123",
         request: {
-          fetch: mock,
+          fetch: mock.fetchHandler,
         },
       });
       await octokit.request("POST /repos/{owner}/{repo}/issues", {
@@ -264,8 +270,8 @@ describe("Smoke test", () => {
         title: "My test issue",
       });
 
-      const [call] = fetchSandbox.calls();
-      expect(call[0]).toEqual(
+      const [call] = fetchcreateInstance.callHistory.callLogs;
+      expect(call.args[0]).toEqual(
         "https://api.github.com/repos/octocat/hello-world/issues",
       );
     },
@@ -273,36 +279,49 @@ describe("Smoke test", () => {
   describe("customFetch", () => {
     afterAll(() => {
       delete process.env.HTTPS_PROXY;
-      jest.clearAllMocks();
+      vi.clearAllMocks();
     });
 
     it("should call undiciFetch with the correct dispatcher", async () => {
       process.env.HTTPS_PROXY = "https://127.0.0.1";
-      const expectedAgent = new ProxyAgent("https://127.0.0.1");
+      expectedAgent = new ProxyAgent("https://127.0.0.1");
 
-      jest.mock("../src", () => {
-        const actualModule = jest.requireActual("../src");
+      vi.doMock("../src/index.js", async () => {
+        const actualModule = await vi.importActual("../src/index.js");
         return {
+          __esModule: true,
           ...actualModule,
-          getProxyAgent: jest.fn(() => expectedAgent),
+          getProxyAgent: vi.fn(() => expectedAgent),
+          customFetch: async function (url: string, opts: any) {
+            return await undici.fetch(url, {
+              dispatcher: getProxyAgent(),
+              ...opts,
+            });
+          },
         };
       });
-      expect(JSON.stringify(getProxyAgent())).toBe(
+
+      const {
+        customFetch: customFetchMocked,
+        getProxyAgent: getProxyAgentMocked,
+      } = await import("../src/index.js");
+
+      expect(JSON.stringify(getProxyAgentMocked())).toBe(
         JSON.stringify(expectedAgent),
       );
 
       // mock undici.fetch to extract the `dispatcher` option passed in.
       // this allows us to verify that `customFetch` correctly sets
       // the dispatcher to `expectedAgent` when HTTPS_PROXY is set.
-      let dispatcher: any;
-      (undici.fetch as jest.Mock).mockImplementation(
-        (_url: string, options: any) => {
-          dispatcher = options.dispatcher;
+      let dispatcher: Dispatcher | undefined;
+      vi.spyOn(undici, "fetch").mockImplementation(
+        (_url: RequestInfo, options?: RequestInit) => {
+          dispatcher = options?.dispatcher;
 
           return Promise.resolve(new Response());
         },
       );
-      await customFetch("http://api.github.com", {});
+      await customFetchMocked("http://api.github.com", {});
       expect(JSON.stringify(dispatcher)).toEqual(JSON.stringify(expectedAgent));
     });
   });
